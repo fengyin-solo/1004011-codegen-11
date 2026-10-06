@@ -3,7 +3,7 @@
     <header class="page-head">
       <div>
         <h2>水质监测管理</h2>
-        <p class="page-desc">维护水质监测记录，围绕监测编号、取样点位、取样日期、PH值做登记、筛选与状态流转。</p>
+        <p class="page-desc">维护水质监测记录，按 PH值、氨氮浓度、COD值、浊度的统一规则判定结论，录入、筛选标记与运营概览共用同一份结果。</p>
       </div>
       <div class="page-actions">
         <button class="btn primary" type="button" @click="openCreate">登记水质监测记录</button>
@@ -29,6 +29,13 @@
         <span>{{ field }}</span>
         <input v-model="filters[field]" :placeholder="`按${field}检索`" />
       </label>
+      <label class="filter-item">
+        <span>结论标记</span>
+        <select v-model="filters['结论标记']">
+          <option value="">全部标记</option>
+          <option v-for="flag in flagOptions" :key="flag" :value="flag">{{ flag }}</option>
+        </select>
+      </label>
       <button class="btn" type="submit">查询</button>
       <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
     </form>
@@ -44,10 +51,14 @@
       <tbody>
         <tr v-for="row in rows" :key="String(row.id)">
           <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
-          <td>{{ row.status }}</td>
+          <td>
+            <span :class="{ 'flag-exceeded': waterQualityFlag(row) === '已超标' }">
+              {{ row.status }}
+            </span>
+          </td>
           <td class="row-actions">
             <button
-              v-for="action in actions"
+              v-for="action in actionsFor(row)"
               :key="action"
               class="link"
               type="button"
@@ -55,6 +66,7 @@
             >
               {{ action }}
             </button>
+            <span v-if="!actionsFor(row).length" class="text-muted">—</span>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -62,6 +74,22 @@
         </tr>
       </tbody>
     </table>
+
+    <div v-if="dialog.open" class="modal-mask" @click.self="closeDialog">
+      <form class="modal-card" @submit.prevent="submitDialog">
+        <h3 class="modal-title">{{ dialog.mode === 'record' ? '录入监测结果' : '超标复查' }} · {{ dialog.code }}</h3>
+        <p class="modal-hint">四项指标按统一规则判定；空值或缺项只出结果，不触发超标。</p>
+        <label v-for="metric in metricFields" :key="metric" class="filter-item">
+          <span>{{ metric }}（{{ metricUnit(metric) }}）</span>
+          <input v-model="dialog.form[metric]" type="number" step="0.01" inputmode="decimal" />
+        </label>
+        <p v-if="dialog.error" class="error-text">{{ dialog.error }}</p>
+        <div class="modal-actions">
+          <button class="btn" type="button" @click="closeDialog">取消</button>
+          <button class="btn primary" type="submit">{{ dialog.mode === 'record' ? '提交结果' : '复查通过' }}</button>
+        </div>
+      </form>
+    </div>
 
     <footer class="page-foot">
       <span>共 {{ total }} 条水质监测记录</span>
@@ -71,36 +99,77 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 
 import {
   downloadEntries,
   listEntries,
   moduleMeta,
+  recordWaterResult,
+  recheckWaterResult,
   runAction as applyAction,
+  waterQualityFlags,
 } from '@/api/local-service'
+import { WATER_METRICS, isWaterExceeded, waterQualityFlag } from '@/data/water-quality'
 import type { EntryRow } from '@/data/types'
 
 const meta = moduleMeta('water_quality')
 const columns = ["监测编号", "取样点位", "取样日期", "PH值", "氨氮浓度", "COD值", "浊度", "监测结论"]
-const actions = ["安排取样", "录入结果", "标记超标"]
-const statuses = ["待取样", "已取样", "已出结果", "已超标"]
-const stats = [{"label": "取样计划数", "value": 0}, {"label": "已出结果数", "value": 0}, {"label": "超标样本数", "value": 0}]
+const metricFields = [...WATER_METRICS]
+const flagOptions = waterQualityFlags()
 
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
-const filters = ref<Record<string, string>>({})
+const filters = ref<Record<string, string>>({ '结论标记': '' })
 const filterFields = columns.slice(0, 3)
+
+const dialog = reactive({
+  open: false,
+  mode: 'record' as 'record' | 'recheck',
+  id: 0,
+  code: '',
+  error: '',
+  form: { PH值: '', 氨氮浓度: '', COD值: '', 浊度: '' } as Record<string, string>,
+})
+
 const statusSummary = computed(() =>
-  statuses.map((status: string) => ({
+  flagOptions.map((status) => ({
     status,
-    count: rows.value.filter((row) => String(row.status) === status).length,
+    count: rows.value.filter((row) => waterQualityFlag(row) === status).length,
   })),
 )
 
+const stats = computed(() => [
+  { label: meta.metrics[0], value: rows.value.length },
+  { label: meta.metrics[1], value: rows.value.filter((row) => waterQualityFlag(row) === '已出结果').length },
+  { label: meta.metrics[2], value: rows.value.filter((row) => isWaterExceeded(row)).length },
+])
+
+function metricUnit(metric: string): string {
+  if (metric === 'PH值') return '6~9'
+  if (metric === '氨氮浓度') return 'mg/L'
+  if (metric === 'COD值') return 'mg/L'
+  return 'NTU'
+}
+
+// 动作随状态收敛：已出结果/已超标的结论只能通过录入或复查留档，不提供手工改状态。
+function actionsFor(row: EntryRow): string[] {
+  const flag = waterQualityFlag(row)
+  if (flag === '待取样') {
+    return ['安排取样']
+  }
+  if (flag === '已取样') {
+    return ['录入结果']
+  }
+  if (flag === '已超标') {
+    return ['复查通过']
+  }
+  return []
+}
+
 function resetFilters() {
-  filters.value = {}
+  filters.value = { '结论标记': '' }
   reload()
 }
 
@@ -112,8 +181,62 @@ function openCreate() {
   errorMessage.value = '水质监测记录登记入口尚未接入审批流'
 }
 
+function openDialog(mode: 'record' | 'recheck', row: EntryRow) {
+  dialog.open = true
+  dialog.mode = mode
+  dialog.id = Number(row.id)
+  dialog.code = String(row['监测编号'] ?? '')
+  dialog.error = ''
+  dialog.form = {
+    PH值: mode === 'recheck' ? String(row.PH值 ?? '') : '',
+    氨氮浓度: mode === 'recheck' ? String(row.氨氮浓度 ?? '') : '',
+    COD值: mode === 'recheck' ? String(row.COD值 ?? '') : '',
+    浊度: mode === 'recheck' ? String(row.浊度 ?? '') : '',
+  }
+}
+
+function closeDialog() {
+  dialog.open = false
+}
+
+function submitDialog() {
+  // 已填项必须是数字；留空表示该指标未录入（不完整数据不触发超标）。
+  const invalid = metricFields.find((metric) => {
+    const raw = dialog.form[metric].trim()
+    return raw !== '' && !Number.isFinite(Number(raw))
+  })
+  if (invalid) {
+    dialog.error = `请填写合法的${invalid}数值`
+    return
+  }
+  const input = {
+    PH值: dialog.form.PH值.trim(),
+    氨氮浓度: dialog.form.氨氮浓度.trim(),
+    COD值: dialog.form.COD值.trim(),
+    浊度: dialog.form.浊度.trim(),
+  }
+  const result = dialog.mode === 'record'
+    ? recordWaterResult(dialog.id, input)
+    : recheckWaterResult(dialog.id, input)
+  if (!result.ok) {
+    dialog.error = result.message
+    return
+  }
+  closeDialog()
+  errorMessage.value = result.message
+  reload()
+}
+
 function runAction(action: string, row: EntryRow) {
   errorMessage.value = ''
+  if (action === '录入结果') {
+    openDialog('record', row)
+    return
+  }
+  if (action === '复查通过') {
+    openDialog('recheck', row)
+    return
+  }
   const result = applyAction(meta.key, Number(row.id), action)
   if (!result.ok) {
     errorMessage.value = result.message
@@ -135,3 +258,45 @@ function reload() {
 
 onMounted(reload)
 </script>
+
+<style scoped>
+.text-muted {
+  color: var(--muted);
+}
+.flag-exceeded {
+  color: #b42318;
+  font-weight: 600;
+}
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(16, 24, 40, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+}
+.modal-card {
+  background: #fff;
+  border-radius: 10px;
+  padding: 18px 20px;
+  width: 420px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.modal-title {
+  margin: 0;
+  font-size: 16px;
+}
+.modal-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+</style>

@@ -68,4 +68,7 @@ npm run build
 - 字段、状态、动作与流转目标集中在 `frontend/src/data/modules.ts`；示例数据在
   `frontend/src/data/seed.ts`。
 - 状态流转只允许在 `local-service.ts` 里改，页面组件不做业务判断。
+- 水质监测的超标判定只有一份规则，在 `frontend/src/data/water-quality.ts`：录入结果、
+  列表结论标记筛选、运营概览异常量都引用它；空值或缺项不触发超标，已留档结论不重复判定，
+  复查通过后编号流程恢复到「已出结果」。
 - 想回到初始数据：清掉浏览器里 `underground-pipeline-inspection:entries` 这一项，或调用 `resetModule(模块)`。
